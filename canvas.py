@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 
 import argparse
+import asyncio
 import curses
 import datetime
 import json
 import logging
 import os
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
-import requests
+import aiofiles
+import aiohttp
 from crontab import CronTab
 from rich.progress import Progress
 
@@ -19,6 +19,7 @@ BASE_URL = ""
 CONFIG_FILE = ".config.json"
 PAGE_LIMIT = 10000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FILE_OPEN_LIMIT = 100
 
 logger = logging.getLogger('canvas_logger')
 logger.setLevel(logging.DEBUG)
@@ -58,17 +59,17 @@ class ProgressTracker:
     def __init__(self, progress):
         self.progress = progress
         self.task_ids = {}
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock()
 
-    def add_course_task(self, course_name, total):
-        with self.lock:
+    async def add_course_task(self, course_name, total):
+        async with self.lock:
             task_id = self.progress.add_task(
                 f"Downloading files for {course_name}", total=total)
             self.task_ids[course_name] = task_id
             return task_id
 
-    def advance_course_task(self, course_name):
-        with self.lock:
+    async def advance_course_task(self, course_name):
+        async with self.lock:
             task_id = self.task_ids.get(course_name)
             if task_id is not None:
                 self.progress.update(task_id, advance=1)
@@ -162,20 +163,6 @@ def store_download_path(path):
     logger.debug(f"Stored download path: {path}")
 
 
-def create_session(token):
-    session = requests.Session()
-    session.headers.update({'Authorization': 'Bearer ' + token})
-    logger.debug("Created session with updated headers.")
-    return session
-
-
-def get_courses(session):
-    response = session.get(BASE_URL + "/api/v1/courses",
-                           params={'per_page': PAGE_LIMIT})
-    logger.debug(f"Retrieved courses. Status code: {response.status_code}")
-    return response.json() if response.status_code == 200 else []
-
-
 def get_stored_selections():
     selections = get_configs('selections') or {}
     logger.debug("Retrieved stored selections.")
@@ -232,24 +219,6 @@ def curses_select_courses(screen: curses.window, courses):
     store_selections({str(k): v for k, v in selections.items()})
 
 
-def get_folder_list(session: requests.Session, course_id: str):
-    response = session.get(
-        BASE_URL +
-        f"/api/v1/courses/{course_id}/folders",
-        params={
-            "per_page": PAGE_LIMIT})
-    return response.json()
-
-
-def get_file_list(session: requests.Session, course_id: str) -> dict:
-    response = session.get(
-        BASE_URL +
-        f"/api/v1/courses/{course_id}/files",
-        params={
-            "per_page": PAGE_LIMIT})
-    return response.json()
-
-
 def clean_url(url):
     o = urlparse(url)
     return o.scheme + "://" + o.netloc
@@ -269,7 +238,18 @@ def prompt_for_input(prompt, validator=None, default=None):
             print("Invalid input. Please try again.")
 
 
-def setup():
+async def create_session(token) -> aiohttp.ClientSession:
+    session = aiohttp.ClientSession()
+    session.headers.update({"Authorization": f"Bearer {token}"})
+    return session
+
+
+async def get_courses(session):
+    async with session.get(BASE_URL + "/api/v1/courses", params={'per_page': PAGE_LIMIT}) as response:
+        return await response.json() if response.status == 200 else []
+
+
+async def setup():
     global BASE_URL, BASE_DIR
     configs = {}
     if os.path.exists(CONFIG_FILE):
@@ -303,6 +283,7 @@ def setup():
         download_path = prompt_for_input(prompt, default=default_path)
     store_download_path(download_path)
     BASE_DIR = download_path
+
     # Cron Job Setup
     cron_setup_choice = prompt_for_input(
         "Set up a cron job to run every 2 hours? (y/n) [n]: ", default='n').lower()
@@ -310,8 +291,10 @@ def setup():
     setup_cron_job(script_path, add_job=cron_setup_choice == 'y')
 
     # Course Selection
-    session = create_session(token)
-    courses = [course for course in get_courses(session) if 'name' in course]
+    async with await create_session(token) as session:
+        courses = await get_courses(session)
+
+    courses = [course for course in courses if 'name' in course]
     curses.wrapper(curses_select_courses, courses)
     stored_selections = get_stored_selections()
     courses_to_track = [course for course in courses if stored_selections.get(
@@ -327,13 +310,21 @@ def setup():
         f"\nSetup complete! Please run \033[1m{run_command}\033[0m to start tracking.")
 
 
-def download_file(session: requests.Session, file: dict, folder_name: str,
-                  course_name: str, progress_tracker: ProgressTracker):
+async def get_folder_list(session, course_id):
+    async with session.get(BASE_URL + f"/api/v1/courses/{course_id}/folders", params={"per_page": PAGE_LIMIT}) as response:
+        return await response.json()
 
+
+async def get_file_list(session, course_id):
+    async with session.get(BASE_URL + f"/api/v1/courses/{course_id}/files", params={"per_page": PAGE_LIMIT}) as response:
+        return await response.json()
+
+
+async def download_file(session, file, folder_name, course_name, progress_tracker):
     folder_name = "/".join(folder_name.split("/")[1:])
     if not os.path.exists(os.path.join(BASE_DIR, course_name, folder_name)):
         os.makedirs(os.path.join(BASE_DIR, course_name,
-                                 folder_name), exist_ok=True)
+                    folder_name), exist_ok=True)
 
     file_url = file.get("url", "")
     display_name = file.get("display_name", "")
@@ -345,52 +336,63 @@ def download_file(session: requests.Session, file: dict, folder_name: str,
         updated_at_str, "%Y-%m-%dT%H:%M:%SZ")
 
     if is_edited_since(full_file_path, updated_dt):
-        progress_tracker.advance_course_task(course_name)
+        await progress_tracker.advance_course_task(course_name)
         return
 
     if not is_changed_since(full_file_path, updated_dt):
-        progress_tracker.advance_course_task(course_name)
+        await progress_tracker.advance_course_task(course_name)
         return
 
-    file_content = session.get(file_url)
-    if file_content.status_code != 200:
-        logger.debug(
-            f"Failed to download {full_file_path}, status_code: {file_content.status_code}")
-        progress_tracker.advance_course_task(course_name)
-        return
+    async with session.get(file_url) as resp:
+        if resp.status != 200:
+            logger.debug(
+                f"Failed to download {full_file_path}, status_code: {resp.status}")
+            await progress_tracker.advance_course_task(course_name)
+            return
 
-    with open(full_file_path, 'wb') as f:
-        f.write(file_content.content)
-        # save
+        # Read the entire content first
+        content = await resp.read()
+
+    # Write the content to file
+    async with aiofiles.open(full_file_path, 'wb') as f:
+        await f.write(content)
+
     logger.debug(f"Downloaded {full_file_path}")
     change_last_modified(full_file_path, updated_dt)
-    progress_tracker.advance_course_task(course_name)
+    await progress_tracker.advance_course_task(course_name)
 
 
-def get_files_and_download(
-        session, files_url, folder_name, course_name, progress_tracker):
-    files = session.get(files_url).json()
-    with ThreadPoolExecutor() as executor:
+async def get_files_and_download(session, folder_name, course_name, course_id, progress_tracker):
+    files = await get_file_list(session, course_id)
+    progress_tracker.add_course_task(course_name, len(files))
+
+    tasks = [download_file(session, file, folder_name,
+                           course_name, progress_tracker) for file in files]
+    await asyncio.gather(*tasks)
+
+
+async def process_course(session, course, progress_tracker):
+    folders = await get_folder_list(session, course['id'])
+
+    # Create a semaphore to limit concurrent downloads
+    # Adjust the number as needed
+    semaphore = asyncio.Semaphore(FILE_OPEN_LIMIT)
+
+    async def download_wrapper(file):
+        async with semaphore:
+            await download_file(session, file, folder['full_name'], course['name'], progress_tracker)
+
+    tasks = []
+    for folder in folders:
+        files = await get_file_list(session, course['id'])
         for file in files:
-            executor.submit(download_file, session, file,
-                            folder_name, course_name, progress_tracker)
+            task = asyncio.create_task(download_wrapper(file))
+            tasks.append(task)
+
+    await asyncio.gather(*tasks)
 
 
-def process_course(session, course, progress_tracker):
-    folders = get_folder_list(session, course['id'])
-    progress_tracker.add_course_task(course['name'], len(folders))
-
-    with ThreadPoolExecutor() as executor:
-        for folder in folders:
-            folder_name = folder['full_name']
-            files_url = folder['files_url']
-            executor.submit(get_files_and_download, session, files_url,
-                            folder_name, course['name'], progress_tracker)
-
-    progress_tracker.advance_course_task(course['name'])
-
-
-def run():
+async def run():
     global BASE_URL, BASE_DIR
     base_url = get_base_url()
     if not base_url:
@@ -409,28 +411,21 @@ def run():
         return
     BASE_DIR = base_dir
 
-    session = create_session(token)
-    courses = [course for course in get_courses(session) if 'name' in course]
-    stored_selections = get_stored_selections()
-    courses_to_track = [
-        course for course in courses
-        if stored_selections.get(
-            str(course['id']), False
-        )
-    ]
+    async with await create_session(token) as session:
+        courses = [course for course in await get_courses(session) if 'name' in course]
+        stored_selections = get_stored_selections()
+        courses_to_track = [course for course in courses if stored_selections.get(
+            str(course['id']), False)]
 
-    logger.debug("Courses to track: " +
-                 ", ".join([course['name'] for course in courses_to_track]))
+        logger.debug("Courses to track: " +
+                     ", ".join([course['name'] for course in courses_to_track]))
 
-    print("Downloading files...\n")
-
-    with Progress() as progress:
-        progress_tracker = ProgressTracker(progress)
-
-        with ThreadPoolExecutor() as executor:
-            for course in courses_to_track:
-                executor.submit(process_course, session,
-                                course, progress_tracker)
+        print("Downloading files...\n")
+        with Progress() as progress:
+            progress_tracker = ProgressTracker(progress)
+            tasks = [process_course(session, course, progress_tracker)
+                     for course in courses_to_track]
+            await asyncio.gather(*tasks)
 
     print("\nDownload process completed for all courses.")
 
@@ -449,9 +444,9 @@ def main():
         logger.setLevel(logging.WARNING)
 
     if args.command == 'setup':
-        setup()
+        asyncio.run(setup())
     elif args.command == 'run':
-        run()
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
