@@ -8,12 +8,13 @@ import json
 import logging
 import os
 import sys
+from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
 from crontab import CronTab
-from rich.progress import Progress
+from rich.progress import Progress, TaskID
 
 BASE_URL = ""
 CONFIG_FILE = ".config.json"
@@ -30,7 +31,7 @@ logger.addHandler(handler)
 logger.propagate = False
 
 
-def setup_cron_job(script_path, add_job):
+def setup_cron_job(script_path: str, add_job: bool) -> None:
     cron = CronTab(user=True)
     job_command = f'/usr/bin/python3 {script_path} run'
 
@@ -55,25 +56,25 @@ def setup_cron_job(script_path, add_job):
 
 
 class ProgressTracker:
-    def __init__(self, progress):
+    def __init__(self, progress: Progress):
         self.progress = progress
         self.task_ids = {}
         self.lock = asyncio.Lock()
 
-    async def add_course_task(self, course_name, total):
+    async def add_course_task(self, course_name: str, total: int) -> TaskID:
         async with self.lock:
             task_id = self.progress.add_task(course_name, total=total)
             self.task_ids[course_name] = task_id
             return task_id
 
-    async def advance_course_task(self, course_name):
+    async def advance_course_task(self, course_name: str) -> None:
         async with self.lock:
             task_id = self.task_ids.get(course_name)
             if task_id is not None:
                 self.progress.update(task_id, advance=1)
 
 
-def is_edited_since(filename, timestamp: datetime.datetime):
+def is_edited_since(filename: str, timestamp: datetime.datetime) -> bool:
     if not os.path.exists(filename):
         logger.debug(f"File {filename} does not exist.")
         return False
@@ -85,7 +86,7 @@ def is_edited_since(filename, timestamp: datetime.datetime):
     return file_modified
 
 
-def is_changed_since(filename, timestamp: datetime.datetime):
+def is_changed_since(filename: str, timestamp: datetime.datetime) -> bool:
     if not os.path.exists(filename):
         return True
     file_modified = os.path.getmtime(filename) < timestamp.timestamp()
@@ -93,7 +94,7 @@ def is_changed_since(filename, timestamp: datetime.datetime):
     return file_modified
 
 
-def change_last_modified(filename, timestamp: datetime.datetime):
+def change_last_modified(filename: str, timestamp: datetime.datetime) -> None:
     if not os.path.exists(filename):
         logger.debug(
             f"Cannot change last modified time. File {filename} does not exist.")
@@ -102,7 +103,7 @@ def change_last_modified(filename, timestamp: datetime.datetime):
     logger.debug(f"Changed last modified time for {filename} to {timestamp}")
 
 
-def update_configs(key, value):
+def update_configs(key: Any, value: Any) -> None:
     configs = {}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as file:
@@ -114,7 +115,7 @@ def update_configs(key, value):
         logger.debug(f"Updated {key} in config file.")
 
 
-def get_configs(key):
+def get_configs(key: Any) -> Any:
     if not os.path.exists(CONFIG_FILE):
         logger.debug(f"Config file {CONFIG_FILE} not found.")
         return None
@@ -124,61 +125,61 @@ def get_configs(key):
     return configs.get(key, None)
 
 
-def get_stored_token():
+def get_stored_token() -> str:
     token = get_configs('token')
     logger.debug("Retrieved stored token." if token else "No token stored.")
     return token
 
 
-def store_token(token):
+def store_token(token: str) -> None:
     update_configs('token', token)
     logger.debug("Stored token.")
 
 
-def get_base_url():
+def get_base_url() -> str:
     base_url = get_configs('base_url')
     logger.debug(
         "Retrieved stored base_url." if base_url else "No base_url stored.")
     return base_url
 
 
-def store_base_url(base_url: str):
+def store_base_url(base_url: str) -> None:
     global BASE_URL
     BASE_URL = base_url
     update_configs('base_url', base_url)
     logger.debug("Stored base_url.")
 
 
-def get_download_path():
+def get_download_path() -> str:
     path = get_configs('download_path')
     if path:
         logger.debug(f"Retrieved stored download path: {path}")
     return path
 
 
-def store_download_path(path):
+def store_download_path(path: str) -> None:
     update_configs('download_path', path)
     logger.debug(f"Stored download path: {path}")
 
 
-def get_stored_selections():
+def get_stored_selections() -> dict[str, bool]:
     selections = get_configs('selections') or {}
     logger.debug("Retrieved stored selections.")
     return selections
 
 
-def store_selections(selections):
+def store_selections(selections: dict[str, bool]) -> None:
     update_configs('selections', selections)
     logger.debug("Stored selections.")
 
 
-def curses_select_courses(screen: curses.window, courses):
+def curses_select_courses(screen: curses.window, courses: list[dict[str, Any]]) -> None:
     current_row = 0
     stored_selections = get_stored_selections()
     selections = {course['id']: stored_selections.get(
         str(course['id']), False) for course in courses}
 
-    def print_menu(row):
+    def print_menu(row: int) -> None:
         screen.clear()
         screen.addstr("Select courses to track:\n\n")
 
@@ -217,17 +218,17 @@ def curses_select_courses(screen: curses.window, courses):
     store_selections({str(k): v for k, v in selections.items()})
 
 
-def clean_url(url):
+def clean_url(url: str) -> str:
     o = urlparse(url)
     return o.scheme + "://" + o.netloc
 
 
-def validate_url(url):
+def validate_url(url: str) -> bool:
     parsed_url = urlparse(url)
     return parsed_url.scheme in ('http', 'https')
 
 
-def prompt_for_input(prompt, validator=None, default=None):
+def prompt_for_input(prompt: str, default: str, validator: Optional[Callable[[str], bool]] = None) -> str:
     while True:
         user_input = input(prompt) or default
         if not validator or validator(user_input):
@@ -236,20 +237,21 @@ def prompt_for_input(prompt, validator=None, default=None):
             print("Invalid input. Please try again.")
 
 
-async def create_session(token) -> aiohttp.ClientSession:
+async def create_session(token: str) -> aiohttp.ClientSession:
     connector = aiohttp.TCPConnector(limit_per_host=50)
     session = aiohttp.ClientSession(connector=connector)
     session.headers.update({"Authorization": f"Bearer {token}"})
     return session
 
 
-async def get_courses(session):
+async def get_courses(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
     async with session.get(BASE_URL + "/api/v1/courses", params={'per_page': PAGE_LIMIT}) as response:
         return await response.json() if response.status == 200 else []
 
 
-async def setup():
+async def setup() -> None:
     global BASE_URL, BASE_DIR
+
     configs = {}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as file:
@@ -270,7 +272,8 @@ async def setup():
     token_prompt = f"Enter your OAuth token"
     token_prompt += f" [previous token]: " if default_token else ": "
     token = prompt_for_input(
-        token_prompt, default=default_token) or default_token
+        token_prompt, default=default_token
+    ) or default_token
     store_token(token)
 
     # Download Path
@@ -309,17 +312,17 @@ async def setup():
         f"\nSetup complete! Please run \033[1m{run_command}\033[0m to start tracking.")
 
 
-async def get_folder_list(session, course_id):
+async def get_folder_list(session: aiohttp.ClientSession, course_id: int) -> list[dict[str, Any]]:
     async with session.get(BASE_URL + f"/api/v1/courses/{course_id}/folders", params={"per_page": PAGE_LIMIT}) as response:
         return await response.json()
 
 
-async def get_file_list(session, course_id):
+async def get_file_list(session: aiohttp.ClientSession, course_id: int) -> list[dict[str, Any]]:
     async with session.get(BASE_URL + f"/api/v1/courses/{course_id}/files", params={"per_page": PAGE_LIMIT}) as response:
         return await response.json()
 
 
-async def download_file(session, file, folder_name, course_name):
+async def download_file(session: aiohttp.ClientSession, file: dict, folder_name: str, course_name: str) -> None:
     folder_name = "/".join(folder_name.split("/")[1:])
     if not os.path.exists(os.path.join(BASE_DIR, course_name, folder_name)):
         os.makedirs(os.path.join(BASE_DIR, course_name,
@@ -357,10 +360,10 @@ async def download_file(session, file, folder_name, course_name):
     change_last_modified(full_file_path, updated_dt)
 
 
-async def process_course(session, course, progress_tracker):
+async def process_course(session: aiohttp.ClientSession, course: dict, progress_tracker: ProgressTracker) -> None:
     folders = await get_folder_list(session, course['id'])
 
-    async def file_download_wrapper(file, folder_name):
+    async def file_download_wrapper(file: dict, folder_name: str):
         await download_file(session, file, folder_name, course['name'])
         await progress_tracker.advance_course_task(course['name'])
 
@@ -376,7 +379,8 @@ async def process_course(session, course, progress_tracker):
         async with session.get(folder['files_url']) as files_res:
             files = await files_res.json()
             seen_files = set()
-            for file in sorted(files, key=lambda x: x['updated_at'], reverse=True):
+            for file in sorted(
+                    files, key=lambda x: x['updated_at'], reverse=True):
                 if file['id'] in seen_files:
                     continue
                 seen_files.add(file['id'])
@@ -388,7 +392,7 @@ async def process_course(session, course, progress_tracker):
     await asyncio.gather(*tasks)
 
 
-async def run():
+async def run() -> None:
     global BASE_URL, BASE_DIR
     base_url = get_base_url()
     if not base_url:
