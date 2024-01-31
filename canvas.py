@@ -62,8 +62,7 @@ class ProgressTracker:
 
     async def add_course_task(self, course_name, total):
         async with self.lock:
-            task_id = self.progress.add_task(
-                f"Downloading files for {course_name}", total=total)
+            task_id = self.progress.add_task(course_name, total=total)
             self.task_ids[course_name] = task_id
             return task_id
 
@@ -238,7 +237,7 @@ def prompt_for_input(prompt, validator=None, default=None):
 
 
 async def create_session(token) -> aiohttp.ClientSession:
-    connector = aiohttp.TCPConnector(limit_per_host=100)
+    connector = aiohttp.TCPConnector(limit_per_host=50)
     session = aiohttp.ClientSession(connector=connector)
     session.headers.update({"Authorization": f"Bearer {token}"})
     return session
@@ -320,7 +319,7 @@ async def get_file_list(session, course_id):
         return await response.json()
 
 
-async def download_file(session, file, folder_name, course_name, progress_tracker):
+async def download_file(session, file, folder_name, course_name):
     folder_name = "/".join(folder_name.split("/")[1:])
     if not os.path.exists(os.path.join(BASE_DIR, course_name, folder_name)):
         os.makedirs(os.path.join(BASE_DIR, course_name,
@@ -362,9 +361,16 @@ async def process_course(session, course, progress_tracker):
     folders = await get_folder_list(session, course['id'])
 
     async def file_download_wrapper(file, folder_name):
-        await download_file(session, file, folder_name, course['name'], progress_tracker)
+        await download_file(session, file, folder_name, course['name'])
         await progress_tracker.advance_course_task(course['name'])
 
+    num_files = 0
+    for folder in folders:
+        async with session.get(folder['files_url']) as files_res:
+            files = await files_res.json()
+            num_files += len(set([file['display_name'] for file in files]))
+
+    await progress_tracker.add_course_task(course['name'], num_files)
     tasks = []
     for folder in folders:
         async with session.get(folder['files_url']) as files_res:
@@ -379,7 +385,6 @@ async def process_course(session, course, progress_tracker):
                     file_download_wrapper(file, folder['name']))
                 tasks.append(task)
 
-    await progress_tracker.add_course_task(course['name'], len(tasks))
     await asyncio.gather(*tasks)
 
 
