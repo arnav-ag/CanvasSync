@@ -242,15 +242,6 @@ def get_folder_list(session: requests.Session, course_id: str):
     return response.json()
 
 
-def get_file_list(session: requests.Session, course_id: str) -> dict:
-    response = session.get(
-        BASE_URL +
-        f"/api/v1/courses/{course_id}/files",
-        params={
-            "per_page": PAGE_LIMIT})
-    return response.json()
-
-
 def clean_url(url):
     o = urlparse(url)
     return o.scheme + "://" + o.netloc
@@ -371,8 +362,16 @@ def download_file(session: requests.Session, file: dict, folder_name: str,
 def get_files_and_download(
         session, files_url, folder_name, course_name, progress_tracker):
     files = session.get(files_url).json()
+    files_seen = set()
+    files_to_download = []
+    for file in sorted(files, key=lambda f: f['updated_at'], reverse=True):
+        if file['display_name'] in files_seen:
+            continue
+        files_seen.add(file['display_name'])
+        files_to_download.append(file)
+
     with ThreadPoolExecutor() as executor:
-        for file in files:
+        for file in files_to_download:
             executor.submit(download_file, session, file,
                             folder_name, course_name, progress_tracker)
 
@@ -382,7 +381,8 @@ def process_course(session, course, progress_tracker):
     num_files = 0
     for folder in folders:
         files = session.get(folder['files_url']).json()
-        num_files += len(files)
+        num_files += len(set(file['display_name'] for file in files))
+
     progress_tracker.add_course_task(course['name'], num_files)
 
     with ThreadPoolExecutor() as executor:
