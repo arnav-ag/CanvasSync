@@ -21,4 +21,6 @@ Not responsible for:
 - Your newfound organizational pride.
 - The sudden urge to color-code everything.
 
+Note that the main branch is using multi-threading while the async branch uses asyncio. Performance is generally similar so choose what you like 😩  
+
 Happy Syncing! 🎓💾
