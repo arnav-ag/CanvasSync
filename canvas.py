@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
@@ -361,7 +362,7 @@ def download_file(session: requests.Session, file: dict, folder_name: str,
 
     with open(full_file_path, 'wb') as f:
         f.write(file_content.content)
-        # save
+
     logger.debug(f"Downloaded {full_file_path}")
     change_last_modified(full_file_path, updated_dt)
     progress_tracker.advance_course_task(course_name)
@@ -378,7 +379,11 @@ def get_files_and_download(
 
 def process_course(session, course, progress_tracker):
     folders = get_folder_list(session, course['id'])
-    progress_tracker.add_course_task(course['name'], len(folders))
+    num_files = 0
+    for folder in folders:
+        files = session.get(folder['files_url']).json()
+        num_files += len(files)
+    progress_tracker.add_course_task(course['name'], num_files)
 
     with ThreadPoolExecutor() as executor:
         for folder in folders:
@@ -386,8 +391,6 @@ def process_course(session, course, progress_tracker):
             files_url = folder['files_url']
             executor.submit(get_files_and_download, session, files_url,
                             folder_name, course['name'], progress_tracker)
-
-    progress_tracker.advance_course_task(course['name'])
 
 
 def run():
