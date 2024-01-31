@@ -19,7 +19,6 @@ BASE_URL = ""
 CONFIG_FILE = ".config.json"
 PAGE_LIMIT = 10000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILE_OPEN_LIMIT = 100
 
 logger = logging.getLogger('canvas_logger')
 logger.setLevel(logging.DEBUG)
@@ -239,7 +238,8 @@ def prompt_for_input(prompt, validator=None, default=None):
 
 
 async def create_session(token) -> aiohttp.ClientSession:
-    session = aiohttp.ClientSession()
+    connector = aiohttp.TCPConnector(limit_per_host=100)
+    session = aiohttp.ClientSession(connector=connector)
     session.headers.update({"Authorization": f"Bearer {token}"})
     return session
 
@@ -336,18 +336,15 @@ async def download_file(session, file, folder_name, course_name, progress_tracke
         updated_at_str, "%Y-%m-%dT%H:%M:%SZ")
 
     if is_edited_since(full_file_path, updated_dt):
-        await progress_tracker.advance_course_task(course_name)
         return
 
     if not is_changed_since(full_file_path, updated_dt):
-        await progress_tracker.advance_course_task(course_name)
         return
 
     async with session.get(file_url) as resp:
         if resp.status != 200:
             logger.debug(
                 f"Failed to download {full_file_path}, status_code: {resp.status}")
-            await progress_tracker.advance_course_task(course_name)
             return
 
         # Read the entire content first
@@ -359,36 +356,24 @@ async def download_file(session, file, folder_name, course_name, progress_tracke
 
     logger.debug(f"Downloaded {full_file_path}")
     change_last_modified(full_file_path, updated_dt)
-    await progress_tracker.advance_course_task(course_name)
-
-
-async def get_files_and_download(session, folder_name, course_name, course_id, progress_tracker):
-    files = await get_file_list(session, course_id)
-    progress_tracker.add_course_task(course_name, len(files))
-
-    tasks = [download_file(session, file, folder_name,
-                           course_name, progress_tracker) for file in files]
-    await asyncio.gather(*tasks)
 
 
 async def process_course(session, course, progress_tracker):
     folders = await get_folder_list(session, course['id'])
 
-    # Create a semaphore to limit concurrent downloads
-    # Adjust the number as needed
-    semaphore = asyncio.Semaphore(FILE_OPEN_LIMIT)
-
-    async def download_wrapper(file):
-        async with semaphore:
-            await download_file(session, file, folder['full_name'], course['name'], progress_tracker)
+    async def file_download_wrapper(file, folder_name):
+        await download_file(session, file, folder_name, course['name'], progress_tracker)
+        await progress_tracker.advance_course_task(course['name'])
 
     tasks = []
     for folder in folders:
-        files = await get_file_list(session, course['id'])
-        for file in files:
-            task = asyncio.create_task(download_wrapper(file))
-            tasks.append(task)
-
+        async with session.get(folder['files_url']) as files_res:
+            files = await files_res.json()
+            for file in files:
+                task = asyncio.create_task(
+                    file_download_wrapper(file, folder['name']))
+                tasks.append(task)
+    await progress_tracker.add_course_task(course['name'], len(tasks))
     await asyncio.gather(*tasks)
 
 
