@@ -369,10 +369,16 @@ async def process_course(session, course, progress_tracker):
     for folder in folders:
         async with session.get(folder['files_url']) as files_res:
             files = await files_res.json()
-            for file in files:
+            seen_files = set()
+            for file in sorted(files, key=lambda x: x['updated_at'], reverse=True):
+                if file['id'] in seen_files:
+                    continue
+                seen_files.add(file['id'])
+
                 task = asyncio.create_task(
                     file_download_wrapper(file, folder['name']))
                 tasks.append(task)
+
     await progress_tracker.add_course_task(course['name'], len(tasks))
     await asyncio.gather(*tasks)
 
