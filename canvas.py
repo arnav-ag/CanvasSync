@@ -17,7 +17,7 @@ from crontab import CronTab
 from rich.progress import Progress
 
 BASE_URL = ""
-CONFIG_FILE = ".config.json"
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), '.config.json')
 PAGE_LIMIT = 10000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
