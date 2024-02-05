@@ -13,7 +13,8 @@ Welcome to CanvasSync, your slightly overenthusiastic digital organizer. It down
 
 - Automatically downloads files from Canvas.
 - Runs in the background.
-- Might make you feel like a tech wizard (no guarantees).
+- Multithreaded/Async (pick your poison)
+- Only downloads new/updated files on each run (doesn't touch files modified by user)
 
 ## Disclaimer
 
