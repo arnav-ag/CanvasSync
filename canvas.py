@@ -33,7 +33,7 @@ logger.propagate = False
 
 def setup_cron_job(script_path, add_job):
     cron = CronTab(user=True)
-    job_command = f'{sys.executable} {script_path} run'
+    job_command = f'{sys.executable} {script_path} --debug run > {os.path.join(os.path.dirname(__file__), "canvas.log")} 2>&1'
 
     # Find existing job
     existing_job = None
