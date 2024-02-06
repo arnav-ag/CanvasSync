@@ -361,7 +361,7 @@ def download_file(session: requests.Session, file: dict, folder_name: str,
 
 def get_files_and_download(
         session, files_url, folder_name, course_name, progress_tracker):
-    files = session.get(files_url).json()
+    files = session.get(files_url, params={'per_page': PAGE_LIMIT}).json()
     files_seen = set()
     files_to_download = []
     for file in sorted(files, key=lambda f: f['updated_at'], reverse=True):
@@ -380,7 +380,8 @@ def process_course(session, course, progress_tracker):
     folders = get_folder_list(session, course['id'])
     num_files = 0
     for folder in folders:
-        files = session.get(folder['files_url']).json()
+        files = session.get(folder['files_url'], params={
+                            'per_page': PAGE_LIMIT}).json()
         num_files += len(set(file['display_name'] for file in files))
 
     progress_tracker.add_course_task(course['name'], num_files)
