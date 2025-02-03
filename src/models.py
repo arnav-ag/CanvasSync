@@ -24,12 +24,12 @@ class FolderDict(TypedDict):
 class ProgressTracker:
     progress: Progress
     task_ids: Dict[str, TaskID] = field(default_factory=dict)
-    downloaded_files: Dict[str, List[Dict[str, str]]
-                           ] = field(default_factory=dict)
+    downloaded_files: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
 
     def add_course_task(self, course_name: str, total: int) -> TaskID:
         task_id = self.progress.add_task(
-            f"Downloading files for {course_name}", total=total)
+            f"Downloading files for {course_name}", total=total
+        )
         self.task_ids[course_name] = task_id
         return task_id
 

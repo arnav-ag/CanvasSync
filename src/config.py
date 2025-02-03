@@ -15,23 +15,30 @@ class CanvasConfig:
     token: str = ""
     download_path: str = ""
     selections: Dict[str, bool] = field(default_factory=dict)
-    api: Optional[CanvasAPI] = None
+    _api: Optional[CanvasAPI] = None  # Changed to private
+
+    @property
+    def api(self) -> CanvasAPI:
+        if self._api is None:
+            self._api = CanvasAPI(self.base_url, self.token)
+        return self._api
 
     def load(self) -> None:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r") as file:
                 config_data = json.load(file)
                 for key, value in config_data.items():
-                    setattr(self, key, value)
-        self.api = CanvasAPI(self.base_url, self.token)
+                    if key != "_api":  # Don't load the API from JSON
+                        setattr(self, key, value)
 
     def save(self) -> None:
         with open(CONFIG_FILE, "w") as file:
-            json.dump(
-                {k: v for k, v in self.__dict__.items() if k != 'api'}, file)
+            # Save everything except the API
+            data = {k: v for k, v in self.__dict__.items() if k != "_api"}
+            json.dump(data, file)
 
     def update(self, key: str, value: Any) -> None:
         setattr(self, key, value)
-        if key in ['base_url', 'token']:
-            self.api = CanvasAPI(self.base_url, self.token)
+        if key in ["base_url", "token"]:
+            self._api = CanvasAPI(self.base_url, self.token)
         self.save()

@@ -14,10 +14,7 @@ logger = setup_logger()
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["setup", "run"])
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
     if args.debug:
@@ -33,6 +30,7 @@ async def main() -> None:
         await setup(config)
     elif args.command == "run":
         await run(config)
+
 
 if __name__ == "__main__":
     trio.run(main)
