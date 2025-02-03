@@ -1,0 +1,2 @@
+class CanvasAPIError(Exception):
+    pass
