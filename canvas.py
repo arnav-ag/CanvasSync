@@ -7,38 +7,198 @@ import json
 import logging
 import os
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, TypedDict
 from urllib.parse import urlparse
 
-import requests
+import httpx
+import trio
 from crontab import CronTab
-from rich.progress import Progress
+from rich import print as rprint
+from rich.progress import Progress, TaskID
+from rich.tree import Tree
 
-BASE_URL = ""
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), ".config.json")
-PAGE_LIMIT = 10000
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE: str = os.path.join(os.path.dirname(__file__), ".config.json")
+PAGE_LIMIT: int = 10000
 
 logger = logging.getLogger("canvas_logger")
 logger.setLevel(logging.DEBUG)
 handler = logging.StreamHandler()
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.propagate = False
 
 
-def setup_cron_job(script_path, add_job):
-    cron = CronTab(user=True)
-    job_command = f'{sys.executable} {script_path} --debug run > {os.path.join(os.path.dirname(__file__), "canvas.log")} 2>&1'
+class CourseDict(TypedDict):
+    id: int
+    name: str
 
-    # Find existing job
-    existing_job = None
-    for job in cron:
-        if job.command == job_command:
-            existing_job = job
-            break
+
+class FileDict(TypedDict):
+    url: str
+    display_name: str
+    updated_at: str
+
+
+class FolderDict(TypedDict):
+    files_url: str
+    full_name: str
+
+
+class CanvasAPIError(Exception):
+    pass
+
+
+class CanvasAPI:
+    def __init__(self, base_url: str, token: str, page_limit: int = 10000):
+        self.base_url = base_url
+        self.token = token
+        self.page_limit = page_limit
+        self.client: Optional[httpx.AsyncClient] = None
+        self.logger = logging.getLogger("canvas_logger")
+
+    async def __aenter__(self):
+        await self.create_client()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close_client()
+
+    async def create_client(self):
+        self.client = httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {self.token}"})
+
+    async def close_client(self):
+        if self.client:
+            await self.client.aclose()
+            self.client = None
+
+    async def _request(self, method: str, endpoint: str, **kwargs) -> Any:
+        if not self.client:
+            await self.create_client()
+
+        url = f"{self.base_url}/api/v1/{endpoint}"
+        params = kwargs.get('params', {})
+        params['per_page'] = self.page_limit
+
+        max_retries = 3
+        retry_delay = 1
+
+        for attempt in range(max_retries):
+            try:
+                self.logger.debug(f"Trying to get URL: {url=} {
+                                  method=} {params=} {kwargs=}")
+                response = await self.client.request(method, url, params=params, **kwargs)
+                if response.status_code == 403:
+                    self.logger.debug(response.text)
+                    raise CanvasAPIError(
+                        "Access forbidden. Check your API token and permissions.")
+                # response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:  # Too Many Requests
+                    retry_after = int(e.response.headers.get(
+                        'Retry-After', retry_delay))
+                    self.logger.warning(f"Rate limited. Retrying after {
+                                        retry_after} seconds.")
+                    await trio.sleep(retry_after)
+                elif attempt == max_retries - 1:
+                    raise CanvasAPIError(
+                        f"HTTP error {e.response.status_code}: {str(e)}")
+                else:
+                    await trio.sleep(retry_delay * (2 ** attempt))
+            except httpx.RequestError as e:
+                raise CanvasAPIError(f"Network error: {str(e)}")
+
+        raise CanvasAPIError(
+            "Max retries reached. Unable to complete the request.")
+
+    async def get_courses(self) -> List[CourseDict]:
+        courses = await self._request('GET', 'courses')
+        return [course for course in courses if 'name' in course and 'id' in course]
+
+    async def get_folder_list(self, course_id: str) -> List[Dict[str, Any]]:
+        return await self._request('GET', f'courses/{course_id}/folders')
+
+    async def get_files(self, files_url: str) -> List[FileDict]:
+        # Extract the relative path from the full URL
+        relative_path = files_url.split('/api/v1/')[-1]
+        return await self._request('GET', relative_path)
+
+    async def download_file(self, file_url: str) -> bytes:
+        if not self.client:
+            await self.create_client()
+
+        try:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                response = await client.get(file_url, headers={"Authorization": f"Bearer {self.token}"})
+                response.raise_for_status()
+                return response.content
+        except httpx.HTTPStatusError as e:
+            raise CanvasAPIError(
+                f"HTTP error {e.response.status_code} while downloading file: {str(e)}")
+        except httpx.RequestError as e:
+            raise CanvasAPIError(
+                f"Network error while downloading file: {str(e)}")
+
+
+@dataclass
+class CanvasConfig:
+    base_url: str = ""
+    base_dir: str = os.path.dirname(os.path.abspath(__file__))
+    token: str = ""
+    download_path: str = ""
+    selections: Dict[str, bool] = field(default_factory=dict)
+    api: Optional[CanvasAPI] = None
+
+    def load(self) -> None:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as file:
+                config_data = json.load(file)
+                for key, value in config_data.items():
+                    setattr(self, key, value)
+        self.api = CanvasAPI(self.base_url, self.token)
+
+    def save(self) -> None:
+        with open(CONFIG_FILE, "w") as file:
+            json.dump(
+                {k: v for k, v in self.__dict__.items() if k != 'api'}, file)
+
+    def update(self, key: str, value: Any) -> None:
+        setattr(self, key, value)
+        if key in ['base_url', 'token']:
+            self.api = CanvasAPI(self.base_url, self.token)
+        self.save()
+
+
+@dataclass
+class ProgressTracker:
+    progress: Progress
+    task_ids: Dict[str, TaskID] = field(default_factory=dict)
+    downloaded_files: Dict[str, List[Dict[str, str]]
+        ] = field(default_factory=dict)
+
+    def add_course_task(self, course_name: str, total: int) -> TaskID:
+        task_id = self.progress.add_task(f"Downloading files for {
+                                         course_name}", total=total)
+        self.task_ids[course_name] = task_id
+        return task_id
+
+    def advance_course_task(self, course_name: str) -> None:
+        task_id = self.task_ids.get(course_name)
+        if task_id is not None:
+            self.progress.update(task_id, advance=1)
+
+
+def setup_cron_job(script_path: str, add_job: bool) -> None:
+    cron = CronTab(user=True)
+    job_command = f'{sys.executable} {
+        script_path} - -debug run > {os.path.join(os.path.dirname(__file__), "canvas.log")} 2 > &1'
+
+    existing_job = next(
+        (job for job in cron if job.command == job_command), None)
 
     if add_job and not existing_job:
         job = cron.new(command=job_command)
@@ -52,41 +212,19 @@ def setup_cron_job(script_path, add_job):
         print("Existing cron job removed.")
 
 
-class ProgressTracker:
-    def __init__(self, progress):
-        self.progress = progress
-        self.task_ids = {}
-        self.lock = threading.Lock()
-
-    def add_course_task(self, course_name, total):
-        with self.lock:
-            task_id = self.progress.add_task(
-                f"Downloading files for {course_name}", total=total
-            )
-            self.task_ids[course_name] = task_id
-            return task_id
-
-    def advance_course_task(self, course_name):
-        with self.lock:
-            task_id = self.task_ids.get(course_name)
-            if task_id is not None:
-                self.progress.update(task_id, advance=1)
-
-
-def is_edited_since(filename, timestamp: datetime.datetime):
+def is_edited_since(filename: str, timestamp: datetime.datetime) -> bool:
     if not os.path.exists(filename):
         logger.debug(f"File {filename} does not exist.")
         return False
     file_modified = os.path.getmtime(filename) > timestamp.timestamp()
     logger.debug(f"File {filename} edited since check: {file_modified}")
     if file_modified:
-        logger.debug(
-            f"File was edited at {os.path.getmtime(filename)}, given timestamp is {timestamp.timestamp()}"
-        )
+        logger.debug(f"File was edited at {os.path.getmtime(
+            filename)}, given timestamp is {timestamp.timestamp()}")
     return file_modified
 
 
-def is_changed_since(filename, timestamp: datetime.datetime):
+def is_changed_since(filename: str, timestamp: datetime.datetime) -> bool:
     if not os.path.exists(filename):
         return True
     file_modified = os.path.getmtime(filename) < timestamp.timestamp()
@@ -94,129 +232,62 @@ def is_changed_since(filename, timestamp: datetime.datetime):
     return file_modified
 
 
-def change_last_modified(filename, timestamp: datetime.datetime):
+def change_last_modified(filename: str, timestamp: datetime.datetime) -> None:
     if not os.path.exists(filename):
-        logger.debug(
-            f"Cannot change last modified time. File {filename} does not exist."
-        )
+        logger.debug(f"Cannot change last modified time. File {
+                     filename} does not exist.")
         return
     os.utime(filename, (timestamp.timestamp(), timestamp.timestamp()))
     logger.debug(f"Changed last modified time for {filename} to {timestamp}")
 
 
-def update_configs(key, value):
-    configs = {}
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as file:
-            configs = json.load(file)
-            logger.debug("Loaded existing config file.")
-    configs[key] = value
-    with open(CONFIG_FILE, "w") as file:
-        json.dump(configs, file)
-        logger.debug(f"Updated {key} in config file.")
+def escape_path(path: str) -> str:
+    return path.replace(os.path.sep, '_').replace(" ", "_")
 
 
-def get_configs(key):
-    if not os.path.exists(CONFIG_FILE):
-        logger.debug(f"Config file {CONFIG_FILE} not found.")
-        return None
-    with open(CONFIG_FILE, "r") as file:
-        configs = json.load(file)
-        logger.debug(f"Retrieved {key} from config file.")
-    return configs.get(key, None)
+def clean_url(url: str) -> str:
+    o = urlparse(url)
+    return f"{o.scheme}://{o.netloc}"
 
 
-def get_stored_token():
-    token = get_configs("token")
-    logger.debug("Retrieved stored token." if token else "No token stored.")
-    return token
+def validate_url(url: str) -> bool:
+    parsed_url = urlparse(url)
+    return parsed_url.scheme in ("http", "https")
 
 
-def store_token(token):
-    update_configs("token", token)
-    logger.debug("Stored token.")
+def prompt_for_input(
+    prompt: str, validator: Optional[callable] = None, default: Optional[str] = None) -> str | None:
+    while True:
+        user_input = input(prompt) or default
+        if user_input and (not validator or validator(user_input)):
+            return user_input
+        else:
+            print("Invalid input. Please try again.")
 
 
-def get_base_url():
-    base_url = get_configs("base_url")
-    logger.debug("Retrieved stored base_url." if base_url else "No base_url stored.")
-    return base_url
-
-
-def store_base_url(base_url: str):
-    global BASE_URL
-    BASE_URL = base_url
-    update_configs("base_url", base_url)
-    logger.debug("Stored base_url.")
-
-
-def get_download_path():
-    path = get_configs("download_path")
-    if path:
-        logger.debug(f"Retrieved stored download path: {path}")
-    return path
-
-
-def store_download_path(path):
-    update_configs("download_path", path)
-    logger.debug(f"Stored download path: {path}")
-
-
-def create_session(token):
-    session = requests.Session()
-    session.headers.update({"Authorization": "Bearer " + token})
-    session.params = {"per_page": PAGE_LIMIT}
-    logger.debug("Created session with updated headers.")
-    return session
-
-
-def get_courses(session):
-    response = session.get(
-        BASE_URL + "/api/v1/courses", params={"per_page": PAGE_LIMIT}
-    )
-    logger.debug(f"Retrieved courses. Status code: {response.status_code}")
-    return response.json() if response.status_code == 200 else []
-
-
-def get_stored_selections():
-    selections = get_configs("selections") or {}
-    logger.debug("Retrieved stored selections.")
-    return selections
-
-
-def store_selections(selections):
-    update_configs("selections", selections)
-    logger.debug("Stored selections.")
-
-
-def curses_select_courses(screen: curses.window, courses):
+def curses_select_courses(
+    screen: curses.window, courses: List[CourseDict], config: CanvasConfig) -> None:
     current_row = 0
-    stored_selections = get_stored_selections()
     selections = {
-        course["id"]: stored_selections.get(str(course["id"]), False)
+        course["id"]: config.selections.get(str(course["id"]), False)
         for course in courses
     }
 
-    def print_menu(row):
+    def print_menu(row: int) -> None:
         screen.clear()
         screen.addstr("Select courses to track:\n\n")
 
         for idx, course in enumerate(courses):
-            if selections.get(course["id"], False):
-                selected_indicator = "[✔]"
-            else:
-                selected_indicator = "[ ]"
-
+            selected_indicator = "[✔]" if selections.get(
+                course["id"], False) else "[ ]"
             if idx == row:
-                screen.addstr(
-                    f"{selected_indicator} {course['name']}\n", curses.A_REVERSE
-                )
+                screen.addstr(f"{selected_indicator} {
+                              course['name']}\n", curses.A_REVERSE)
             else:
                 screen.addstr(f"{selected_indicator} {course['name']}\n")
 
-        screen.addstr(
-            f"\n{len([course for course in courses if selections.get(course['id'], False)])} courses selected\n"
-        )
+        screen.addstr(f"\n{len([course for course in courses if selections.get(
+            course['id'], False)])} courses selected\n")
         screen.addstr("Press q to quit\n")
         screen.refresh()
 
@@ -234,249 +305,253 @@ def curses_select_courses(screen: curses.window, courses):
         elif key == ord("q"):
             break
 
-    store_selections({str(k): v for k, v in selections.items()})
+    config.update("selections", {str(k): v for k, v in selections.items()})
 
 
-def get_folder_list(session: requests.Session, course_id: str):
-    response = session.get(
-        BASE_URL + f"/api/v1/courses/{course_id}/folders",
-        params={"per_page": PAGE_LIMIT},
-    )
-    return response.json()
+async def download_file(
+    api: CanvasAPI,
+    file: FileDict,
+    folder_name: str,
+    course_name: str,
+    progress_tracker: ProgressTracker,
+    config: CanvasConfig,
+) -> None:
+    logger.debug(f"Downloading file from {course_name}")
+
+    clean_course_name = escape_path(course_name.replace(" ", "_"))
+    clean_folder_name = folder_name.replace(" ", "_")
+    clean_folder_name = "/".join(clean_folder_name.split("/")[1:])
+
+    dir = os.path.join(config.base_dir, clean_course_name, clean_folder_name)
+    os.makedirs(dir, exist_ok=True)
+
+    file_url = file.get("url", "")
+    display_name = file.get("display_name", "")
+    full_file_path = os.path.join(
+        config.base_dir, clean_course_name, clean_folder_name, display_name)
+
+    updated_at_str = file.get("updated_at", "0000-00-00T00:00:00Z")
+    updated_dt = datetime.datetime.strptime(
+        updated_at_str, "%Y-%m-%dT%H:%M:%SZ")
+
+    if is_edited_since(full_file_path, updated_dt) or not is_changed_since(
+        full_file_path, updated_dt):
+        progress_tracker.advance_course_task(course_name)
+        logger.debug(f"Skipped file from {course_name}")
+        return
+
+    try:
+        file_content = await api.download_file(file_url)
+        with open(full_file_path, "wb") as f:
+            f.write(file_content)
+
+        progress_tracker.downloaded_files.setdefault(course_name, []).append({
+                    "folder": folder_name,
+                    "name": display_name
+                })
+
+        logger.debug(f"Downloaded {full_file_path}")
+        change_last_modified(full_file_path, updated_dt)
+        progress_tracker.advance_course_task(course_name)
+    except CanvasAPIError as e:
+        logger.error(f"Canvas API error while downloading file {
+                     display_name} from {course_name}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error downloading file {
+                     display_name} from {course_name}: {str(e)}")
 
 
-def clean_url(url):
-    o = urlparse(url)
-    return o.scheme + "://" + o.netloc
+async def get_files_and_download(
+    api: CanvasAPI,
+    files_url: str,
+    folder_name: str,
+    course_name: str,
+    progress_tracker: ProgressTracker,
+    config: CanvasConfig,
+) -> None:
+    try:
+
+        if 'CS4212' in course_name:
+            print(files_url)
+        files = await api.get_files(files_url)
+
+        if not isinstance(files, list):
+            logger.error(f"Unexpected response format for files in folder {
+                         folder_name} of course {course_name}. Response: {files}")
+            return
+
+        files_seen: set[str] = set()
+        files_to_download: List[FileDict] = []
+        for file in sorted(files, key=lambda f: f.get(
+            "updated_at", ""), reverse=True):
+            if isinstance(file, dict) and "display_name" in file:
+                if file["display_name"] not in files_seen:
+                    files_seen.add(file["display_name"])
+                    files_to_download.append(file)
+            else:
+                logger.warning(f"Unexpected file format in folder {
+                               folder_name} of course {course_name}: {file}")
+
+        logger.debug(f"{course_name}'s folder {folder_name} has {
+                     len(files_to_download)} files to download")
+        async with trio.open_nursery() as nursery:
+            for file in files_to_download:
+                nursery.start_soon(
+                    download_file, api, file, folder_name, course_name, progress_tracker, config)
+    except CanvasAPIError as e:
+        logger.error(f"Canvas API error while processing folder {
+                     folder_name} in course {course_name}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error processing folder {
+                     folder_name} in course {course_name}: {str(e)}")
 
 
-def validate_url(url):
-    parsed_url = urlparse(url)
-    return parsed_url.scheme in ("http", "https")
+async def process_course(api: CanvasAPI, course: CourseDict, progress_tracker: ProgressTracker, config: CanvasConfig) -> None:
+    try:
+        folders = await api.get_folder_list(str(course["id"]))
+        num_files = 0
+        for folder in folders:
+            try:
+                files = await api.get_files(folder["files_url"])
+            except CanvasAPIError as e:
+                logger.error(f"Canvas API error while processing course {
+                             course['name']}, folder {folder['full_name']}: {str(e)}")
+                continue
+
+            if not isinstance(files, list):
+                logger.error(f"Unexpected response format for files in course {
+                             course['name']}. Response: {files}")
+                continue
+
+            try:
+                num_files += len(set(file["display_name"] for file in files if isinstance(
+                    file, dict) and "display_name" in file))
+            except Exception as e:
+                logger.error(f"Error processing files for course {
+                             course['name']}: {str(e)}")
+                logger.debug(f"Files data: {files}")
+                continue
+
+        logger.debug(f"{course['name']} has {num_files} files")
+        progress_tracker.add_course_task(course["name"], num_files)
+
+        async with trio.open_nursery() as nursery:
+            for folder in folders:
+                nursery.start_soon(
+                    get_files_and_download,
+                    api,
+                    folder["files_url"],
+                    folder["full_name"],
+                    course["name"],
+                    progress_tracker,
+                    config,
+                )
+    except CanvasAPIError as e:
+        logger.error(f"Canvas API error while processing course {
+                     course['name']}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error processing course {course['name']}: {str(e)}")
 
 
-def prompt_for_input(prompt, validator=None, default=None):
-    while True:
-        user_input = input(prompt) or default
-        if not validator or validator(user_input):
-            return user_input
-        else:
-            print("Invalid input. Please try again.")
+async def run(config: CanvasConfig) -> None:
+    if not config.base_url or not config.token or not config.base_dir:
+        print("Missing configuration. Please run python canvas.py setup to get started.")
+        return
+
+    async with config.api as api:
+        try:
+            courses = await api.get_courses()
+            courses_to_track = [course for course in courses if config.selections.get(
+                str(course["id"]), False)]
+
+            logger.debug("Courses to track: " +
+                         ", ".join([course["name"] for course in courses_to_track]))
+
+            print("Downloading files...\n")
+
+            with Progress() as progress:
+                progress_tracker = ProgressTracker(progress)
+
+                async with trio.open_nursery() as nursery:
+                    for course in courses_to_track:
+                        nursery.start_soon(
+                            process_course, api, course, progress_tracker, config)
+
+            print("\nDownload process completed for all courses.")
+
+            # Pretty print downloaded files
+            if progress_tracker.downloaded_files:
+                tree = Tree(
+    "📁 Downloaded/Updated Files",
+     guide_style="bold bright_blue")
+                for course_name, files in progress_tracker.downloaded_files.items():
+                    course_branch = tree.add(f"[bold green]🎓 {course_name}[/]")
+                    folders = {}
+                    for file_info in files:
+                        folder_path = file_info['folder']
+                        if folder_path not in folders:
+                            folders[folder_path] = []
+                        folders[folder_path].append(file_info['name'])
+
+                    for folder_path, filenames in folders.items():
+                        folder_branch = course_branch.add(
+                            f"[cyan]📂 {folder_path}[/]",
+                            guide_style="cyan"
+                        )
+                        for filename in filenames:
+                            folder_branch.add(f"📄 [white]{filename}[/]")
+                rprint(tree)
+            else:
+                rprint("[bold yellow]🌟 No new files were downloaded or updated.[/]")
+
+        except CanvasAPIError as e:
+            logger.error(f"Canvas API error: {str(e)}")
+            print(
+                f"An error occurred while communicating with Canvas: {str(e)}")
 
 
-def setup():
-    global BASE_URL, BASE_DIR
-    configs = {}
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as file:
-            configs = json.load(file)
+async def setup(config: CanvasConfig) -> None:
+    default_url = config.base_url
+    prompt = f"Enter your Canvas URL[{
+        default_url}]: " if default_url else "Enter your Canvas URL: "
+    base_url = prompt_for_input(
+        prompt, validator=validate_url, default=default_url)
+    config.update("base_url", clean_url(base_url))
 
-    # Canvas URL
-    default_url = configs.get("base_url", BASE_URL)
-    prompt = "Enter your Canvas URL"
-    prompt += f" [{default_url}]: " if default_url else ": "
-    base_url = prompt_for_input(prompt, validator=validate_url, default=default_url)
-    base_url = clean_url(base_url)
-    store_base_url(base_url)
-    BASE_URL = base_url
+    token_prompt = "Enter your OAuth token [previous token]: " if config.token else "Enter your OAuth token: "
+    token = prompt_for_input(
+        token_prompt, default=config.token) or config.token
+    config.update("token", token)
 
-    # OAuth Token
-    default_token = configs.get("token", "")
-    token_prompt = "Enter your OAuth token"
-    token_prompt += " [previous token]: " if default_token else ": "
-    token = prompt_for_input(token_prompt, default=default_token) or default_token
-    store_token(token)
-
-    # Download Path
-    default_path = configs.get("download_path", BASE_DIR)
+    default_path = config.download_path or config.base_dir
     prompt = f"Enter path to download files [{default_path}]: "
     download_path = prompt_for_input(prompt, default=default_path)
     while not os.path.exists(download_path):
         print(f"Invalid path: {download_path}. ", end="")
         download_path = prompt_for_input(prompt, default=default_path)
-    store_download_path(download_path)
-    BASE_DIR = download_path
+    config.update("download_path", download_path)
+    config.update("base_dir", download_path)
 
-    # Cron Job Setup
     cron_setup_choice = prompt_for_input(
-        "Set up a cron job to run every 2 hours? (y/n) [n]: ", default="n"
-    ).lower()
+        "Set up a cron job to run every 2 hours? (y/n) [n]: ", default="n").lower()
     script_path = os.path.abspath(__file__)
     setup_cron_job(script_path, add_job=cron_setup_choice == "y")
 
-    # Course Selection
-    session = create_session(token)
-    courses = [course for course in get_courses(session) if "name" in course]
-    curses.wrapper(curses_select_courses, courses)
-    stored_selections = get_stored_selections()
-    courses_to_track = [
-        course for course in courses if stored_selections.get(str(course["id"]), False)
-    ]
-    for course in courses_to_track:
-        course_path = os.path.join(download_path, course["name"])
-        if not os.path.exists(course_path):
-            os.makedirs(course_path)
+    async with config.api as api:
+        courses = await api.get_courses()
+        curses.wrapper(curses_select_courses, courses, config)
 
     script_name = os.path.basename(sys.argv[0])
-    run_command = f"python {script_name} run"
-    print(
-        f"\nSetup complete! Please run \033[1m{run_command}\033[0m to start tracking."
-    )
+    print(f"\nSetup complete! Please run \033[1mpython {
+          script_name} run\033[0m to start tracking.")
 
 
-def download_file(
-    session: requests.Session,
-    file: dict,
-    folder_name: str,
-    course_name: str,
-    progress_tracker: ProgressTracker,
-):
-    logger.debug(f"Downloading file from {course_name}")
-
-    # Clean up the folder names
-    clean_course_name = course_name.replace(" ", "_")
-    clean_folder_name = folder_name.replace(" ", "_")
-    clean_folder_name = "/".join(clean_folder_name.split("/")[1:])
-
-    # Create the folders if it doesn't exist
-    dir = os.path.join(BASE_DIR, clean_course_name, clean_folder_name)
-    if not os.path.exists(dir):
-        os.makedirs(dir, exist_ok=True)
-
-    file_url = file.get("url", "")
-    display_name = file.get("display_name", "")
-    full_file_path = os.path.join(
-        BASE_DIR, clean_course_name, clean_folder_name, display_name
-    )
-
-    updated_at_str = file.get("updated_at", "0000-00-00T00:00:00Z")
-    updated_dt = datetime.datetime.strptime(updated_at_str, "%Y-%m-%dT%H:%M:%SZ")
-
-    if is_edited_since(full_file_path, updated_dt):
-        progress_tracker.advance_course_task(course_name)
-        logger.debug(f"Downloaded file from {course_name}")
-        return
-
-    if not is_changed_since(full_file_path, updated_dt):
-        progress_tracker.advance_course_task(course_name)
-        logger.debug(f"Downloaded file from {course_name}")
-        return
-
-    file_content = session.get(file_url)
-    if file_content.status_code != 200:
-        logger.debug(
-            f"Failed to download {full_file_path}, status_code: {file_content.status_code}"
-        )
-        progress_tracker.advance_course_task(course_name)
-        logger.debug(f"Downloaded file from {course_name}")
-        return
-
-    with open(full_file_path, "wb") as f:
-        f.write(file_content.content)
-
-    logger.debug(f"Downloaded {full_file_path}")
-    logger.debug(f"Downloaded file from {course_name}")
-    change_last_modified(full_file_path, updated_dt)
-    progress_tracker.advance_course_task(course_name)
-
-
-def get_files_and_download(
-    session, files_url, folder_name, course_name, progress_tracker
-):
-    files = session.get(files_url, params={"per_page": PAGE_LIMIT}).json()
-    files_seen = set()
-    files_to_download = []
-    for file in sorted(files, key=lambda f: f["updated_at"], reverse=True):
-        if file["display_name"] in files_seen:
-            continue
-        files_seen.add(file["display_name"])
-        files_to_download.append(file)
-
-    with ThreadPoolExecutor() as executor:
-        logger.debug(
-            f"{course_name}'s folder has {len(files_to_download)} files to download"
-        )
-        for file in files_to_download:
-            executor.submit(
-                download_file, session, file, folder_name, course_name, progress_tracker
-            )
-
-
-def process_course(session, course, progress_tracker):
-    folders = get_folder_list(session, course["id"])
-    num_files = 0
-    for folder in folders:
-        files = session.get(folder["files_url"], params={"per_page": PAGE_LIMIT}).json()
-        num_files += len(set(file["display_name"] for file in files))
-
-    logger.debug(f"{course['name']} has {num_files} files")
-    progress_tracker.add_course_task(course["name"], num_files)
-
-    with ThreadPoolExecutor() as executor:
-        for folder in folders:
-            course_name = course["name"]
-            folder_name = folder["full_name"]
-            files_url = folder["files_url"]
-            executor.submit(
-                get_files_and_download,
-                session,
-                files_url,
-                folder_name,
-                course_name,
-                progress_tracker,
-            )
-
-
-def run():
-    global BASE_URL, BASE_DIR
-    base_url = get_base_url()
-    if not base_url:
-        print("No base_url found. Please run python canvas.py setup to get started.")
-        return
-    BASE_URL = base_url
-
-    token = get_stored_token()
-    if not token:
-        print("No token found. Please run python canvas.py setup to get started.")
-        return
-
-    base_dir = get_download_path()
-    if not base_dir:
-        print(
-            "No download path found. Please run python canvas.py setup to get started."
-        )
-        return
-    BASE_DIR = base_dir
-
-    session = create_session(token)
-    courses = [course for course in get_courses(session) if "name" in course]
-    stored_selections = get_stored_selections()
-    courses_to_track = [
-        course for course in courses if stored_selections.get(str(course["id"]), False)
-    ]
-
-    logger.debug(
-        "Courses to track: "
-        + ", ".join([course["name"] for course in courses_to_track])
-    )
-
-    print("Downloading files...\n")
-
-    with Progress() as progress:
-        progress_tracker = ProgressTracker(progress)
-
-        with ThreadPoolExecutor() as executor:
-            for course in courses_to_track:
-                executor.submit(process_course, session, course, progress_tracker)
-
-    print("\nDownload process completed for all courses.")
-
-
-def main():
-    parser = argparse.ArgumentParser()
+async def main() -> None:
+    parser= argparse.ArgumentParser()
     parser.add_argument("command", choices=["setup", "run"])
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging")
+    args= parser.parse_args()
 
     if args.debug:
         logger.setLevel(logging.DEBUG)
@@ -484,11 +559,13 @@ def main():
     else:
         logger.setLevel(logging.WARNING)
 
-    if args.command == "setup":
-        setup()
-    elif args.command == "run":
-        run()
+    config= CanvasConfig()
+    config.load()
 
+    if args.command == "setup":
+        await setup(config)
+    elif args.command == "run":
+        await run(config)
 
 if __name__ == "__main__":
-    main()
+    trio.run(main)
