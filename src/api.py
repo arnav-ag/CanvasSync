@@ -102,15 +102,17 @@ class CanvasAPI:
         return await self._request("GET", relative_path)
 
     async def download_file(self, file_url: str) -> bytes:
-        if not self.client:
-            await self.create_client()
-
         try:
-            async with httpx.AsyncClient(follow_redirects=True) as client:
-                response = await client.get(
-                    file_url,
-                    headers={"Authorization": f"Bearer {self.token}"},
-                )
+            async with httpx.AsyncClient(follow_redirects=False) as client:
+                response = await client.get(file_url)
+                while response.status_code == 302:
+                    # we want to follow the redirects and update the cookies at each step
+                    # to handle the authentication
+                    redirect_url = response.headers["Location"]
+                    response = await client.get(redirect_url)
+                    # update the cookies for the next request
+                    client.cookies.update(response.cookies)
+
                 response.raise_for_status()
                 return response.content
         except httpx.HTTPStatusError as e:

@@ -344,7 +344,7 @@ async def setup(config: CanvasConfig) -> None:
     cron_setup_choice = prompt_for_input(
         "Set up a cron job to run every 2 hours? (y/n) [n]: ", default="n"
     ).lower()
-    script_path = os.path.abspath(__file__)
+    script_path = os.path.join(os.path.dirname(__file__), "canvas.py")
     setup_cron_job(script_path, add_job=cron_setup_choice == "y")
 
     async with config.api as api:
